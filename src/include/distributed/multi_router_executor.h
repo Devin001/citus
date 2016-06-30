@@ -29,5 +29,6 @@ extern void RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, lon
 							  Task *task);
 extern void RouterExecutorFinish(QueryDesc *queryDesc);
 extern void RouterExecutorEnd(QueryDesc *queryDesc);
+extern void InstallRouterExecutorShmemHook(void);
 
 #endif /* MULTI_ROUTER_EXECUTOR_H_ */

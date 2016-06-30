@@ -29,6 +29,7 @@
 #include "executor/executor.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
+#include "storage/ipc.h"
 
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -41,10 +42,12 @@
 bool AllModificationsCommutative = false;
 
 static uint64 shardForTransaction = INVALID_SHARD_ID;
-static bool callbackInstalled = false;
+static bool subXactAbortAttempted = false;
 static List *participantList = NIL;
 static List *failedParticipantList = NIL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
+static void InitTransactionStateForTask(Task *task);
 static LOCKMODE CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery);
 static void AcquireExecutorShardLock(Task *task, LOCKMODE lockMode);
 static bool ExecuteTaskAndStoreResults(QueryDesc *queryDesc,
@@ -58,6 +61,7 @@ static bool SendQueryInSingleRowMode(PGconn *connection, char *query);
 static bool StoreQueryResult(MaterialState *routerState, PGconn *connection,
 							 TupleDesc tupleDescriptor, int64 *rows);
 static bool ConsumeQueryResult(PGconn *connection, int64 *rows);
+static void RegisterRouterExecutorXactCallbacks();
 static void ExecuteTransactionEnd(char *sqlCommand);
 static void RouterTransactionCallback(XactEvent event, void *arg);
 static void RouterSubtransactionCallback(SubXactEvent event, SubTransactionId subId,
@@ -87,56 +91,7 @@ RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task)
 		{
 			if (shardForTransaction == INVALID_SHARD_ID)
 			{
-				MemoryContext oldContext = NULL;
-				ListCell *placementCell = NULL;
-
-				oldContext = MemoryContextSwitchTo(TopTransactionContext);
-
-				foreach(placementCell, task->taskPlacementList)
-				{
-					ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
-					PGconn *connection = GetOrEstablishConnection(placement->nodeName,
-																  placement->nodePort);
-					TxnParticipant *txnParticipant = NULL;
-					bool participantHealthy = true;
-					txnParticipant = (TxnParticipant *) palloc(sizeof(TxnParticipant));
-
-					CopyShardPlacement(placement, (ShardPlacement *) txnParticipant);
-					txnParticipant->connection = connection;
-
-					if (txnParticipant->connection != NULL)
-					{
-						PGresult *result = PQexec(connection, "BEGIN");
-						if (PQresultStatus(result) == PGRES_COMMAND_OK)
-						{
-							participantHealthy = true;
-						}
-						else
-						{
-							WarnRemoteError(connection, result);
-						}
-					}
-
-					if (participantHealthy)
-					{
-						participantList = lappend(participantList, txnParticipant);
-					}
-					else
-					{
-						failedParticipantList = lappend(participantList, txnParticipant);
-					}
-				}
-
-				MemoryContextSwitchTo(oldContext);
-
-				shardForTransaction = task->anchorShardId;
-
-				if (!callbackInstalled)
-				{
-					RegisterXactCallback(RouterTransactionCallback, NULL);
-					RegisterSubXactCallback(RouterSubtransactionCallback, NULL);
-					callbackInstalled = true;
-				}
+				InitTransactionStateForTask(task);
 			}
 			else if (shardForTransaction != task->anchorShardId)
 			{
@@ -174,6 +129,56 @@ RouterExecutorStart(QueryDesc *queryDesc, int eflags, Task *task)
 	{
 		AcquireExecutorShardLock(task, lockMode);
 	}
+}
+
+
+/* TODO: write comment */
+static void
+InitTransactionStateForTask(Task *task)
+{
+	MemoryContext oldContext = NULL;
+	ListCell *placementCell = NULL;
+
+	oldContext = MemoryContextSwitchTo(TopTransactionContext);
+
+	foreach(placementCell, task->taskPlacementList)
+	{
+		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
+		PGconn *connection = GetOrEstablishConnection(placement->nodeName,
+													  placement->nodePort);
+		TxnParticipant *txnParticipant = NULL;
+		bool participantHealthy = true;
+		txnParticipant = (TxnParticipant *) palloc(sizeof(TxnParticipant));
+
+		CopyShardPlacement(placement, (ShardPlacement *) txnParticipant);
+		txnParticipant->connection = connection;
+
+		if (txnParticipant->connection != NULL)
+		{
+			PGresult *result = PQexec(connection, "BEGIN");
+			if (PQresultStatus(result) == PGRES_COMMAND_OK)
+			{
+				participantHealthy = true;
+			}
+			else
+			{
+				WarnRemoteError(connection, result);
+			}
+		}
+
+		if (participantHealthy)
+		{
+			participantList = lappend(participantList, txnParticipant);
+		}
+		else
+		{
+			failedParticipantList = lappend(participantList, txnParticipant);
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	shardForTransaction = task->anchorShardId;
 }
 
 
@@ -899,6 +904,29 @@ RouterExecutorEnd(QueryDesc *queryDesc)
 }
 
 
+/* TODO: write comment */
+void
+InstallRouterExecutorShmemHook()
+{
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = RegisterRouterExecutorXactCallbacks;
+}
+
+
+/* TODO: Write comment */
+static void
+RegisterRouterExecutorXactCallbacks()
+{
+	RegisterXactCallback(RouterTransactionCallback, NULL);
+	RegisterSubXactCallback(RouterSubtransactionCallback, NULL);
+
+	if (prev_shmem_startup_hook != NULL)
+	{
+		prev_shmem_startup_hook();
+	}
+}
+
+
 /*
  * RouterTransactionCallback handles committing or aborting remote transactions
  * after the local one has committed or aborted. It only sends COMMIT or ABORT
@@ -915,14 +943,14 @@ RouterTransactionCallback(XactEvent event, void *arg)
 
 	switch (event)
 	{
-		/* after the local transaction commits, commit the remote ones */
-		case XACT_EVENT_COMMIT:
 #if (PG_VERSION_NUM >= 90500)
 		case XACT_EVENT_PARALLEL_COMMIT:
 #endif
+		case XACT_EVENT_COMMIT:
 		{
 			ListCell *failedPlacementCell = NULL;
 
+			/* after the local transaction commits, send COMMIT to healthy remotes */
 			ExecuteTransactionEnd("COMMIT TRANSACTION");
 
 			/* now mark all failed placements inactive */
@@ -944,12 +972,12 @@ RouterTransactionCallback(XactEvent event, void *arg)
 			break;
 		}
 
-		/* if the local transaction aborts, send ABORT to healthy remotes */
-		case XACT_EVENT_ABORT:
 #if (PG_VERSION_NUM >= 90500)
 		case XACT_EVENT_PARALLEL_ABORT:
 #endif
+		case XACT_EVENT_ABORT:
 		{
+			/* if the local transaction is aborting, send ABORT to healthy remotes */
 			ExecuteTransactionEnd("ABORT TRANSACTION");
 
 			break;
@@ -966,12 +994,20 @@ RouterTransactionCallback(XactEvent event, void *arg)
 			break;
 		}
 
-		/* we don't have any work to do pre-commit */
-		case XACT_EVENT_PRE_COMMIT:
 #if (PG_VERSION_NUM >= 90500)
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 #endif
+		case XACT_EVENT_PRE_COMMIT:
 		{
+			if (subXactAbortAttempted)
+			{
+				subXactAbortAttempted = false;
+
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot ROLLBACK TO SAVEPOINT in transactions "
+									   "which modify distributed tables")));
+			}
+
 			/* leave early to avoid resetting transaction state */
 			return;
 		}
@@ -981,6 +1017,7 @@ RouterTransactionCallback(XactEvent event, void *arg)
 	shardForTransaction = INVALID_SHARD_ID;
 	participantList = NIL;
 	failedParticipantList = NIL;
+	subXactAbortAttempted = false;
 }
 
 
@@ -993,12 +1030,7 @@ RouterSubtransactionCallback(SubXactEvent event, SubTransactionId subId,
 {
 	if ((shardForTransaction != INVALID_SHARD_ID) && (event == SUBXACT_EVENT_ABORT_SUB))
 	{
-		UnregisterSubXactCallback(RouterSubtransactionCallback, NULL);
-
-		AbortOutOfAnyTransaction();
-
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot ROLLBACK in transactions which modify "
-							   "distributed tables")));
+		/* TODO: warn here */
+		subXactAbortAttempted = true;
 	}
 }
